@@ -1,0 +1,34 @@
+{
+  "manifest_version": 2,
+  "name": "KEEL-PHNX Capture (v0)",
+  "version": "0.3.0",
+  "description": "Transcript-only capture for permitted AI web interfaces; forwards sanitized events to localhost KEEL bridge.",
+  "permissions": [
+    "storage",
+    "https://*/*",
+    "http://127.0.0.1:42069/*"
+  ],
+  "background": {
+    "scripts": [
+      "background.js"
+    ]
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "browser_action": {
+    "default_title": "KEEL-PHNX"
+  }
+}

@@ -1,0 +1,575 @@
+import http from "node:http";
+import { promises as fsp } from "node:fs";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const HOST = process.env.KEEL_HOST || "127.0.0.1";
+const PORT = Number(process.env.KEEL_PORT || "42069");
+const KEEL_DIR = process.env.KEEL_DIR || path.join(__dirname, "runs");
+const KEEL_TOKEN = process.env.KEEL_TOKEN || "";
+const MAX_BODY_BYTES = Number(process.env.KEEL_MAX_BODY_BYTES || 2_000_000);
+const VERSION = "v0.6.0";
+
+const LOCK_PATH = path.join(KEEL_DIR, ".bridge.lock");
+let LOCK_OWNED = false;
+
+const ALLOWED_EVENT_TYPES = new Set([
+  "run_started",
+  "user_input",
+  "agent_output",
+  "decision_recorded",
+  "state_updated",
+  "artifact_added",
+  "audit_generated",
+  "run_closed",
+  "proposal",
+  "challenge",
+  "test",
+]);
+
+class HttpError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function sha256Hex(buf) {
+  return crypto.createHash("sha256").update(buf).digest("hex");
+}
+
+function stableStringify(obj) {
+  const seen = new WeakSet();
+  const sorter = (v) => {
+    if (v && typeof v === "object") {
+      if (seen.has(v)) throw new Error("cycle in json");
+      seen.add(v);
+      if (Array.isArray(v)) return v.map(sorter);
+      const out = {};
+      for (const k of Object.keys(v).sort()) out[k] = sorter(v[k]);
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(sorter(obj));
+}
+
+async function mkdirp(p) {
+  await fsp.mkdir(p, { recursive: true });
+}
+
+async function readJson(p) {
+  const s = await fsp.readFile(p, "utf-8");
+  return JSON.parse(s);
+}
+
+async function writeJsonAtomic(p, obj) {
+  const dir = path.dirname(p);
+  const tmp = path.join(dir, `.tmp.${path.basename(p)}.${crypto.randomBytes(6).toString("hex")}`);
+  await fsp.writeFile(tmp, JSON.stringify(obj, null, 2) + "\n", "utf-8");
+  await fsp.rename(tmp, p);
+}
+
+function send(res, status, obj) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(obj));
+}
+
+function assertLocalOnly(req) {
+  if (
+    req.socket.remoteAddress &&
+    !["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress)
+  ) {
+    throw new HttpError(403, "forbidden");
+  }
+}
+
+function requireToken(req) {
+  if (!KEEL_TOKEN) throw new HttpError(500, "KEEL_TOKEN is not set");
+  const tok = req.headers["x-keel-token"];
+  if (tok !== KEEL_TOKEN) throw new HttpError(401, "unauthorized");
+}
+
+async function readBodyJson(req) {
+  const buf = await new Promise((resolve, reject) => {
+    let bytes = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      bytes += c.length;
+      if (bytes > MAX_BODY_BYTES) {
+        reject(new HttpError(413, `body too large > ${MAX_BODY_BYTES}`));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("error", reject);
+  });
+
+  const s = buf.toString("utf-8").trim();
+  if (!s) return {};
+
+  try {
+    return JSON.parse(s);
+  } catch {
+    throw new HttpError(400, "invalid JSON");
+  }
+}
+
+function validateRunId(run_id) {
+  if (typeof run_id !== "string") return false;
+  if (run_id.length < 6 || run_id.length > 128) return false;
+  if (!/^[a-zA-Z0-9._-]+$/.test(run_id)) return false;
+  return true;
+}
+
+function validateEventCore(evt) {
+  if (!evt || typeof evt !== "object") return "event must be object";
+  if (!ALLOWED_EVENT_TYPES.has(evt.type)) return `type not allowed: ${evt.type}`;
+  if (typeof evt.actor_id !== "string" || evt.actor_id.length < 1) return "actor_id required";
+  if (typeof evt.payload === "undefined") return "payload required";
+  if (evt.links && !Array.isArray(evt.links)) return "links must be array";
+  if (evt.source && typeof evt.source !== "string") return "source must be string";
+  if (evt.transform && typeof evt.transform !== "object") return "transform must be object";
+  return null;
+}
+
+function runPaths(run_id) {
+  const runDir = path.join(KEEL_DIR, run_id);
+  return {
+    runDir,
+    eventsPath: path.join(runDir, "events.ndjson"),
+    headPath: path.join(runDir, "HEAD.json"),
+    metaPath: path.join(runDir, "meta.json"),
+    auditPath: path.join(runDir, "audit.json"),
+    statePath: path.join(runDir, "state.json"),
+    artifactsDir: path.join(runDir, "artifacts"),
+  };
+}
+
+function runExists(run_id) {
+  if (!validateRunId(run_id)) return false;
+  const p = runPaths(run_id);
+  return fs.existsSync(p.runDir) && fs.existsSync(p.eventsPath) && fs.existsSync(p.headPath);
+}
+
+async function ensureRunCreated(run_id) {
+  if (!validateRunId(run_id)) throw new HttpError(400, "invalid run_id");
+  const p = runPaths(run_id);
+  await mkdirp(p.runDir);
+  await mkdirp(p.artifactsDir);
+
+  if (!fs.existsSync(p.headPath)) {
+    await writeJsonAtomic(p.headPath, {
+      run_id,
+      seq: 0,
+      last_event_id: null,
+      head_hash: "GENESIS",
+      created_at: nowIso(),
+      version: VERSION,
+    });
+  }
+
+  if (!fs.existsSync(p.metaPath)) {
+    await writeJsonAtomic(p.metaPath, { run_id, created_at: nowIso(), version: VERSION });
+  }
+
+  if (!fs.existsSync(p.eventsPath)) {
+    await fsp.writeFile(p.eventsPath, "", "utf-8");
+  }
+
+  return p;
+}
+
+// Per-run in-process lock to prevent overlapping appends corrupting chain.
+const runLocks = new Map();
+async function withRunLock(run_id, fn) {
+  const prev = runLocks.get(run_id) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+
+  runLocks.set(run_id, current);
+  await prev;
+
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (runLocks.get(run_id) === current) runLocks.delete(run_id);
+  }
+}
+
+async function appendEvent(run_id, evtIn) {
+  if (!runExists(run_id)) throw new HttpError(404, "run not found (start run first)");
+  const p = runPaths(run_id);
+
+  return withRunLock(run_id, async () => {
+    const head = await readJson(p.headPath);
+    const seq = Number(head.seq || 0) + 1;
+    const ts = typeof evtIn.ts === "string" ? evtIn.ts : nowIso();
+    const event_id =
+      typeof evtIn.event_id === "string" && evtIn.event_id.length
+        ? evtIn.event_id
+        : `evt_${ts.replace(/[:.]/g, "-")}_${seq.toString().padStart(6, "0")}`;
+
+    const core = {
+      event_id,
+      run_id,
+      seq,
+      ts,
+      type: evtIn.type,
+      actor_id: evtIn.actor_id,
+      source: evtIn.source || "unknown",
+      links: evtIn.links || [],
+      transform: evtIn.transform || null,
+      payload: evtIn.payload,
+      prev_hash: head.head_hash || "GENESIS",
+    };
+
+    const err = validateEventCore(core);
+    if (err) throw new HttpError(400, err);
+
+    const canonical = stableStringify(core);
+    const hash = sha256Hex(Buffer.from(`${core.prev_hash}\n${canonical}`, "utf-8"));
+    const fullEvt = { ...core, hash };
+
+    const fh = await fsp.open(p.eventsPath, "a");
+    try {
+      await fh.write(JSON.stringify(fullEvt) + "\n", null, "utf-8");
+      await fh.sync();
+    } finally {
+      await fh.close();
+    }
+
+    await writeJsonAtomic(p.headPath, {
+      ...head,
+      seq,
+      last_event_id: event_id,
+      head_hash: hash,
+      updated_at: nowIso(),
+      version: VERSION,
+    });
+
+    return { event_id, hash, prev_hash: core.prev_hash, seq };
+  });
+}
+
+async function auditRun(run_id) {
+  if (!runExists(run_id)) throw new HttpError(404, "run not found");
+  const p = runPaths(run_id);
+  const raw = await fsp.readFile(p.eventsPath, "utf-8");
+  const lines = raw.split("\n").filter((l) => l.trim().length);
+
+  let ok = true;
+  const problems = [];
+  let prev_hash = "GENESIS";
+  let last_hash = "GENESIS";
+  let last_event_id = null;
+  let expectedSeq = 1;
+  const eventIds = new Set();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let evt;
+    try {
+      evt = JSON.parse(line);
+    } catch {
+      ok = false;
+      problems.push({ type: "invalid_json", line: i + 1 });
+      break;
+    }
+
+    if (eventIds.has(evt.event_id)) {
+      ok = false;
+      problems.push({ type: "duplicate_event_id", line: i + 1, event_id: evt.event_id });
+      break;
+    }
+    eventIds.add(evt.event_id);
+
+    if (Number(evt.seq) !== expectedSeq) {
+      ok = false;
+      problems.push({
+        type: "seq_discontinuity",
+        line: i + 1,
+        expected_seq: expectedSeq,
+        found_seq: evt.seq,
+      });
+      break;
+    }
+    expectedSeq++;
+
+    if (evt.prev_hash !== prev_hash) {
+      ok = false;
+      problems.push({
+        type: "hash_chain_break",
+        line: i + 1,
+        expected_prev_hash: prev_hash,
+        found_prev_hash: evt.prev_hash,
+        event_id: evt.event_id,
+      });
+      break;
+    }
+
+    const { hash, ...withoutHash } = evt;
+    let canonical;
+    try {
+      canonical = stableStringify(withoutHash);
+    } catch (e) {
+      ok = false;
+      problems.push({ type: "canonicalization_error", line: i + 1, error: String(e) });
+      break;
+    }
+
+    const recomputed = sha256Hex(Buffer.from(`${evt.prev_hash}\n${canonical}`, "utf-8"));
+    if (recomputed !== hash) {
+      ok = false;
+      problems.push({
+        type: "hash_mismatch",
+        line: i + 1,
+        event_id: evt.event_id,
+        expected_hash: recomputed,
+        found_hash: hash,
+      });
+      break;
+    }
+
+    prev_hash = hash;
+    last_hash = hash;
+    last_event_id = evt.event_id;
+  }
+
+  const head = await readJson(p.headPath);
+  if (head.head_hash !== last_hash) {
+    ok = false;
+    problems.push({
+      type: "head_mismatch",
+      expected_head_hash: last_hash,
+      found_head_hash: head.head_hash,
+    });
+  }
+  if (Number(head.seq) !== lines.length) {
+    ok = false;
+    problems.push({ type: "head_seq_mismatch", expected_seq: lines.length, found_seq: head.seq });
+  }
+
+  const report = {
+    run_id,
+    ok,
+    lines: lines.length,
+    last_event_id,
+    head_hash: last_hash,
+    checked_at: nowIso(),
+    problems,
+    version: VERSION,
+  };
+
+  await writeJsonAtomic(p.auditPath, report);
+  return report;
+}
+
+async function startRun(run_id, meta = {}) {
+  const p = await ensureRunCreated(run_id);
+  const head = await readJson(p.headPath);
+
+  if ((head.seq || 0) > 0) return { ok: true, run_id, already_started: true };
+
+  await writeJsonAtomic(p.metaPath, { run_id, created_at: nowIso(), version: VERSION, ...meta });
+
+  await appendEvent(run_id, {
+    type: "run_started",
+    actor_id: "orchestrator",
+    source: "keel-bridge",
+    payload: { version: VERSION, meta },
+  });
+
+  if (!fs.existsSync(p.statePath)) {
+    await writeJsonAtomic(p.statePath, {
+      run_id,
+      version: VERSION,
+      state: { goals: [], constraints: [], open_questions: [], decisions: [], artifacts: [] },
+      derived_at: nowIso(),
+    });
+  }
+
+  return { ok: true, run_id, already_started: false };
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function acquireBridgeLock() {
+  await mkdirp(KEEL_DIR);
+  const payload = {
+    pid: process.pid,
+    started_at: nowIso(),
+    host: HOST,
+    port: PORT,
+    version: VERSION,
+  };
+
+  try {
+    const fh = await fsp.open(LOCK_PATH, "wx");
+    try {
+      await fh.writeFile(JSON.stringify(payload, null, 2) + "\n", "utf-8");
+    } finally {
+      await fh.close();
+    }
+    LOCK_OWNED = true;
+    return;
+  } catch (e) {
+    if (e.code !== "EEXIST") throw e;
+  }
+
+  try {
+    const raw = await fsp.readFile(LOCK_PATH, "utf-8");
+    const old = JSON.parse(raw);
+    const oldPid = Number(old?.pid);
+    if (oldPid && pidAlive(oldPid)) {
+      const err = new Error(`bridge lock exists and PID ${oldPid} is alive (refusing start)`);
+      err.code = "LIVE_LOCK";
+      err.pid = oldPid;
+      throw err;
+    }
+  } catch (err) {
+    if (err?.code === "LIVE_LOCK") throw err;
+  }
+
+  await fsp.unlink(LOCK_PATH).catch((e) => {
+    if (e?.code !== "ENOENT") throw e;
+  });
+
+  const fh = await fsp.open(LOCK_PATH, "wx");
+  try {
+    await fh.writeFile(JSON.stringify(payload, null, 2) + "\n", "utf-8");
+  } finally {
+    await fh.close();
+  }
+  LOCK_OWNED = true;
+}
+
+async function releaseBridgeLock() {
+  if (!LOCK_OWNED) return;
+  try {
+    const raw = await fsp.readFile(LOCK_PATH, "utf-8");
+    const cur = JSON.parse(raw);
+    if (Number(cur?.pid) === process.pid) {
+      await fsp.unlink(LOCK_PATH).catch(() => {});
+    }
+  } catch {
+    // Best effort.
+  }
+  LOCK_OWNED = false;
+}
+
+// Exit handlers: exit must be synchronous.
+process.on("exit", () => {
+  if (!LOCK_OWNED) return;
+  try {
+    const raw = fs.readFileSync(LOCK_PATH, "utf-8");
+    const cur = JSON.parse(raw);
+    if (Number(cur?.pid) === process.pid) fs.unlinkSync(LOCK_PATH);
+  } catch {
+    // Best effort.
+  }
+});
+
+process.on("SIGINT", async () => {
+  await releaseBridgeLock();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
+  await releaseBridgeLock();
+  process.exit(0);
+});
+
+process.on("uncaughtException", async (err) => {
+  console.error(String(err?.stack || err?.message || err));
+  await releaseBridgeLock();
+  process.exit(1);
+});
+
+process.on("unhandledRejection", async (err) => {
+  console.error(String(err?.stack || err?.message || err));
+  await releaseBridgeLock();
+  process.exit(1);
+});
+
+const server = http.createServer(async (req, res) => {
+  try {
+    assertLocalOnly(req);
+    const url = new URL(req.url || "/", `http://${HOST}:${PORT}`);
+
+    if (url.pathname === "/health" && req.method === "GET") {
+      return send(res, 200, { ok: true, ts: nowIso(), version: VERSION });
+    }
+
+    requireToken(req);
+
+    if (url.pathname === "/v0/runs/start" && req.method === "POST") {
+      const body = await readBodyJson(req);
+      const run_id = body.run_id;
+      if (!validateRunId(run_id)) return send(res, 400, { ok: false, error: "invalid run_id" });
+      const out = await startRun(run_id, body.meta || {});
+      return send(res, 200, out);
+    }
+
+    if (url.pathname === "/v0/events/append" && req.method === "POST") {
+      const body = await readBodyJson(req);
+      const run_id = body.run_id;
+      if (!validateRunId(run_id)) return send(res, 400, { ok: false, error: "invalid run_id" });
+      const evt = body.event;
+      if (!evt) throw new HttpError(400, "missing event");
+      const out = await appendEvent(run_id, evt);
+      return send(res, 200, { ok: true, ...out });
+    }
+
+    if (url.pathname === "/v0/runs/audit" && req.method === "POST") {
+      const body = await readBodyJson(req);
+      const run_id = body.run_id;
+      if (!validateRunId(run_id)) return send(res, 400, { ok: false, error: "invalid run_id" });
+      const report = await auditRun(run_id);
+      return send(res, 200, { ok: true, report });
+    }
+
+    if (url.pathname === "/v0/runs/head" && req.method === "POST") {
+      const body = await readBodyJson(req);
+      const run_id = body.run_id;
+      if (!validateRunId(run_id)) return send(res, 400, { ok: false, error: "invalid run_id" });
+      if (!runExists(run_id)) throw new HttpError(404, "run not found");
+      const head = await readJson(runPaths(run_id).headPath);
+      return send(res, 200, { ok: true, head });
+    }
+
+    return send(res, 404, { ok: false, error: "not found" });
+  } catch (e) {
+    const status = e?.status || 500;
+    return send(res, status, { ok: false, error: String(e?.message || e) });
+  }
+});
+
+await acquireBridgeLock();
+
+server.listen(PORT, HOST, () => {
+  console.log(`[keel-bridge] listening on http://${HOST}:${PORT}`);
+  console.log(`[keel-bridge] KEEL_DIR=${KEEL_DIR}`);
+  console.log(`[keel-bridge] version=${VERSION}`);
+});

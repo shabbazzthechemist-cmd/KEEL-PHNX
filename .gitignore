@@ -1,0 +1,11 @@
+runs/
+**/runs/
+artifacts/
+**/artifacts/
+.bridge.lock
+node_modules/
+.DS_Store
+.env
+.env.*
+*.log
+*.zip
