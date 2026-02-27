@@ -13,7 +13,7 @@ This bundle contains:
 
 ```bash
 cd KEEL-PHNX_codex_bundle
-export KEEL_TOKEN="change_me_long_random"
+export KEEL_TOKEN="$(openssl rand -hex 32)"
 export KEEL_DIR="$HOME/keel-phnx/runs"
 node keel-bridge.mjs
 ```
